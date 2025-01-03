@@ -83,8 +83,9 @@ class MiniJavaCodeGenerator:
 
     def allocate_variable(self, name):
         self.stack_offset -= 4
-        self.symbol_table[name] = self.stack_offset
+        self.symbol_table[name] = self.stack_offset  # Store offset in symbol table
         self.instructions.append(f"    # Allocated {name} at offset {self.stack_offset}")
+        return self.stack_offset
 
     def generate(self):
         print("Starting MIPS code generation...")  # Debug print
@@ -122,28 +123,32 @@ class MiniJavaCodeGenerator:
     def generate_method(self, node):
         print(f"Generating MIPS for Method '{node['name']}'...")  # Debug print
         method_table = {}
+
+        # Allocate stack space for parameters and local variables
         for param in node.get("parameters", []):
             method_table[param["name"]] = self.allocate_variable(param["name"])
         for var in node.get("local_variables", []):
             method_table[var["name"]] = self.allocate_variable(var["name"])
-        self.symbol_table = method_table  # Set the current method's symbol table
-        
-        method_label = node["name"]
-        self.instructions.append(f"{method_label}:")
-        self.instructions.append("    addi $sp, $sp, -4")  # Allocate stack space
+
+        # Save the return address on the stack
+        self.instructions.append(f"{node['name']}:")
+        self.instructions.append("    addi $sp, $sp, -4")  # Space for return address
         self.instructions.append("    sw $ra, 0($sp)")     # Save return address
+
+        # Generate commands in the method body
         for command in node["commands"]:
             self.generate_command(command, method_table)
+
+        # Restore the return address and stack pointer
         self.instructions.append("    lw $ra, 0($sp)")  # Restore return address
         self.instructions.append("    addi $sp, $sp, 4")  # Free stack space
         self.instructions.append("    jr $ra")  # Return
-
 
     def generate_command(self, node, method_table):
         if node["type"] == "Assignment":
             self.evaluate_expression(node["value"], method_table)
             offset = method_table[node["target"]]
-            self.instructions.append(f"    sw $t0, {offset}($sp)")
+            self.instructions.append(f"    sw $t0, {offset}($sp)")  # Store result
         elif node["type"] == "Print":
             self.evaluate_expression(node["expression"], method_table)
             self.instructions.append("    li $v0, 1")  # Print integer syscall
@@ -158,13 +163,17 @@ class MiniJavaCodeGenerator:
             self.instructions.append("    move $v0, $t0  # Return value")
             self.instructions.append("    jr $ra")
         elif node["type"] == "MethodCall":
-            for arg in node["arguments"]:
+            # Push arguments in reverse order
+            for arg in reversed(node["arguments"]):
                 self.evaluate_expression(arg, method_table)
                 self.instructions.append("    addi $sp, $sp, -4")
                 self.instructions.append("    sw $t0, 0($sp)")
+            # Call the method
             self.instructions.append(f"    jal {node['method_name']}")
-            self.instructions.append("    move $t0, $v0  # Save method call result")
-            self.instructions.append("    addi $sp, $sp, 4  # Clean up stack")
+            # Clean up the stack after the call
+            self.instructions.append(f"    addi $sp, $sp, {4 * len(node['arguments'])}")
+            # Save the result in $t0
+            self.instructions.append("    move $t0, $v0")
         else:
             raise ValueError(f"Unsupported command type: {node['type']}")
 
@@ -177,15 +186,21 @@ class MiniJavaCodeGenerator:
         else_label = self.get_unique_label("else")
         end_if_label = self.get_unique_label("end_if")
 
+        # Evaluate the condition
         self.evaluate_expression(node["condition"], method_table)
         self.instructions.append(f"    beqz $t0, {else_label}")
+
+        # Generate the true branch
         self.generate_command(node["if_true"], method_table)
         self.instructions.append(f"    j {end_if_label}")
+
+        # Generate the false branch
         self.instructions.append(f"{else_label}:")
         if "if_false" in node:
             self.generate_command(node["if_false"], method_table)
-        self.instructions.append(f"{end_if_label}:")
 
+        # End label
+        self.instructions.append(f"{end_if_label}:")
 
     def generate_while(self, node, method_table):
         start_label = self.get_unique_label("while_start")
@@ -197,59 +212,56 @@ class MiniJavaCodeGenerator:
         self.instructions.append(f"    j {start_label}")
         self.instructions.append(f"{end_label}:")
 
-
     def evaluate_expression(self, node, method_table):
+        print(f"Evaluating node: {node}")  # Debugging statement
         if not isinstance(node, dict):
             raise ValueError(f"Invalid node structure: {node}")
         if "type" not in node:
             raise ValueError(f"Node missing 'type' key: {node}")
-
         if node["type"] == "Number":
-            self.instructions.append(f"    li $t0, {node['value']}")
+            self.instructions.append(f"    li $t0, {node['value']}")  # Load constant
         elif node["type"] == "Identifier":
-            if node["name"] not in method_table:
+            offset = method_table.get(node["name"])
+            if offset is None:
                 raise ValueError(f"Undefined variable: {node['name']}")
-            offset = method_table[node["name"]]
-            self.instructions.append(f"    lw $t0, {offset}($sp)")
+            self.instructions.append(f"    lw $t0, {offset}($sp)")  # Load variable
         elif node["type"] == "ArithmeticOp":
             self.evaluate_expression(node["left"], method_table)
-            self.instructions.append("    move $t1, $t0")  # Save left operand
+            self.instructions.append("    move $t1, $t0")
             self.evaluate_expression(node["right"], method_table)
-            if node["operator"] == "+":
+            if node["operator"] == "*":
+                self.instructions.append("    mul $t0, $t1, $t0")
+            elif node["operator"] == "+":
                 self.instructions.append("    add $t0, $t1, $t0")
             elif node["operator"] == "-":
                 self.instructions.append("    sub $t0, $t1, $t0")
-            elif node["operator"] == "*":
-                self.instructions.append("    mul $t0, $t1, $t0")
-            elif node["operator"] == "/":
-                self.instructions.append("    div $t0, $t1, $t0")
-        elif node["type"] == "RelationalOp":
-            self.evaluate_expression(node["left"], method_table)
-            self.instructions.append("    move $t1, $t0")  # Save left operand
-            self.evaluate_expression(node["right"], method_table)
-            if node["operator"] == "<":
-                self.instructions.append("    slt $t0, $t1, $t0")
-            elif node["operator"] == ">":
-                self.instructions.append("    slt $t0, $t0, $t1")
         elif node["type"] == "MethodCall":
-            # Evaluate the arguments in the ExpressionList
-            expression_list = node["arguments"]
-            if expression_list["type"] == "ExpressionList":
-                arguments = expression_list["expressions"]
-                if not isinstance(arguments, list):
-                    raise ValueError(f"Invalid ExpressionList structure: {expression_list}")
-                for arg in arguments:
-                    self.evaluate_expression(arg, method_table)
-                    self.instructions.append("    addi $sp, $sp, -4")
-                    self.instructions.append("    sw $t0, 0($sp)")
+            # Handle target
+            self.evaluate_expression(node["target"], method_table)
+            self.instructions.append("    move $t1, $t0  # Save target object")
 
-            # Generate the method call
+            # Extract arguments properly
+            if isinstance(node["arguments"], dict) and node["arguments"].get("type") == "ExpressionList":
+                arguments = node["arguments"].get("expressions", [])
+            else:
+                raise ValueError(f"Invalid arguments for MethodCall: {node}")
+
+            # Push arguments onto the stack
+            for arg in reversed(arguments):
+                self.evaluate_expression(arg, method_table)
+                self.instructions.append("    addi $sp, $sp, -4")
+                self.instructions.append("    sw $t0, 0($sp)")
+
+            # Call the method
             self.instructions.append(f"    jal {node['method_name']}")
 
-            # Retrieve the result of the method call
-            self.instructions.append("    move $t0, $v0")  # Result of the method call is in $v0
-        else:
-            raise ValueError(f"Unsupported expression type: {node['type']}")
+            # Clean up the stack
+            self.instructions.append(f"    addi $sp, $sp, {4 * len(arguments)}")
+
+            # Store result
+            self.instructions.append("    move $t0, $v0")
+
+
 
 
 # Example usage

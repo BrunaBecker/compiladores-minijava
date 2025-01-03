@@ -3,10 +3,12 @@ newline: .asciiz "\n"
 .text
 .globl main
 main:
+    move $t1, $t0  # Save target object
     li $t0, 10
     addi $sp, $sp, -4
     sw $t0, 0($sp)
     jal ComputeFac
+    addi $sp, $sp, 4
     move $t0, $v0
     li $v0, 1
     move $a0, $t0
@@ -20,27 +22,25 @@ Fac_ComputeFac:
 ComputeFac:
     addi $sp, $sp, -4
     sw $ra, 0($sp)
-    lw $t0, None($sp)
-    move $t1, $t0
-    li $t0, 1
-    slt $t0, $t1, $t0
     beqz $t0, else_0
     li $t0, 1
-    sw $t0, None($sp)
+    sw $t0, -8($sp)
     j end_if_1
 else_0:
-    lw $t0, None($sp)
+    lw $t0, -4($sp)
     move $t1, $t0
-    lw $t0, None($sp)
+    move $t1, $t0  # Save target object
+    lw $t0, -4($sp)
     move $t1, $t0
     li $t0, 1
     sub $t0, $t1, $t0
     addi $sp, $sp, -4
     sw $t0, 0($sp)
     jal ComputeFac
+    addi $sp, $sp, 4
     move $t0, $v0
     mul $t0, $t1, $t0
-    sw $t0, None($sp)
+    sw $t0, -8($sp)
 end_if_1:
     lw $ra, 0($sp)
     addi $sp, $sp, 4
