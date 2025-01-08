@@ -15,7 +15,8 @@ class MiniJavaSemanticAnalyzer:
 
     def check_program(self, node):
         if node["type"] == "Program":
-            self.symbol_table = {node["main_class"]["class_name"]: {}}
+            self.symbol_table = {clazz["name"]: {} for clazz in node["classes"]}
+            self.symbol_table[node["main_class"]["class_name"]] = {}
             for clazz in node["classes"]:
                 self.symbol_table[clazz["name"]] = {}
 
@@ -36,8 +37,19 @@ class MiniJavaSemanticAnalyzer:
 
     def check_class(self, node):
         class_name = node["name"]
-        self.symbol_table[class_name] = {}
+        self.symbol_table[class_name] = {"fields": {}, "methods": {}, "extends": node.get("extends")}
+        
+        # Add fields to the class
+        for var in node.get("fields", []):  # Assuming `fields` holds class-level variables
+            self.symbol_table[class_name]["fields"][var["name"]] = var["var_type"]
+        
+        # Add methods to the class
         for method in node["methods"]:
+            method_name = method["name"]
+            self.symbol_table[class_name]["methods"][method_name] = {
+                "parameters": {param["name"]: param["param_type"] for param in method["parameters"]},
+                "local_variables": {var["name"]: var["var_type"] for var in method["local_variables"]}
+            }
             self.check_method(method)
 
     def check_method(self, node):
@@ -49,7 +61,7 @@ class MiniJavaSemanticAnalyzer:
             var_name = var["name"]
             method_table[var_name] = var["var_type"]
 
-        self.symbol_table[node["name"]] = method_table
+        # self.symbol_table[node["name"]] = method_table
 
         for command in node["commands"]:
             self.check_command(command, method_table)
@@ -61,16 +73,15 @@ class MiniJavaSemanticAnalyzer:
         if node["type"] == "Assignment":
             var_name = node["target"]
             print(f"Checking variable '{var_name}' in method table: {method_table}")  # Debug print for variable check
-            if var_name not in method_table:
-                raise SemanticError(f"Semantic Error: Variable '{var_name}' is not declared in the current scope.")
-        # Handle other command types as needed
+            if var_name not in method_table and var_name not in self.symbol_table[class_name]["fields"]:
+                raise SemanticError(f"Variable '{var_name}' is not declared in the current or outer scope.")
 
 
 class MiniJavaCodeGenerator:
-    def __init__(self, syntax_tree):
+    def __init__(self, syntax_tree, symbol_table):
         self.syntax_tree = syntax_tree
+        self.symbol_table = symbol_table  
         self.instructions = []
-        self.symbol_table = {}
         self.stack_offset = 0
         self.label_counter = 0
 
@@ -114,19 +125,23 @@ class MiniJavaCodeGenerator:
         self.instructions.append("    syscall")
 
     def generate_class(self, node):
+        self.current_class = node["name"] 
         for method in node["methods"]:
-            self.instructions.append(f"{node['name']}_{method['name']}:")
+            qualified_name = f"{node['name']}_{method['name']}"
+            self.instructions.append(f"{qualified_name}:")
             self.generate_method(method)
 
     def generate_method(self, node):
-        print(f"Generating MIPS for Method '{node['name']}'...")
-        method_table = {}
+        class_name = self.get_enclosing_class_name(node) 
+        qualified_name = f"{class_name}_{node['name']}"
+        
+        print(f"Generating MIPS for Method '{qualified_name}'...")  
 
         # Method label
-        self.instructions.append(f"{node['name']}:")
-
+        self.instructions.append(f"{qualified_name}:")
+        
         # Prologue: Adjust stack pointer and save necessary registers
-        self.instructions.append("    addi $sp, $sp, -12  # Allocate space for saved registers")
+        self.instructions.append(f"    addi $sp, $sp, {4 * len(node['arguments'])}  # Restore stack")
         self.instructions.append("    sw $ra, 0($sp)      # Save return address")
         self.instructions.append("    sw $s0, 4($sp)      # Save current object reference")
         self.instructions.append("    sw $s1, 8($sp)      # Save caller's $s1")
@@ -135,17 +150,18 @@ class MiniJavaCodeGenerator:
         self.instructions.append("    move $s0, $a0  # Set 'this' reference for the method")
 
         # Map method parameters and variables
+        method_table = {}
         param_offset = 12  # Start after saved registers
         for param in node.get("parameters", []):
             method_table[param["name"]] = param_offset
-            param_offset += 4  # Move to next stack slot for parameters
+            param_offset += 4  # Move to the next stack slot for parameters
 
         var_offset = -4  # Local variables grow negatively on the stack
         for var in node.get("local_variables", []):
             method_table[var["name"]] = var_offset
             var_offset -= 4
 
-        # Store updated stack offsets for local variables and parameters
+        # Update stack offset for local variables
         self.stack_offset = var_offset
 
         # Generate method body
@@ -158,6 +174,8 @@ class MiniJavaCodeGenerator:
         self.instructions.append("    lw $ra, 0($sp)")
         self.instructions.append("    addi $sp, $sp, 12")
         self.instructions.append("    jr $ra")
+        self.instructions.append("    move $s0, $a0  # Restore 'this'")
+
 
     def generate_command(self, node, method_table):
         if node["type"] == "Assignment":
@@ -177,21 +195,44 @@ class MiniJavaCodeGenerator:
             self.evaluate_expression(node["value"], method_table)
             self.instructions.append("    move $v0, $t0")
         elif node["type"] == "MethodCall":
-            self.instructions.append("    addi $sp, $sp, -8")
-            self.instructions.append("    sw $t0, 4($sp)")
-            self.instructions.append("    sw $t1, 0($sp)")
+            print(f"Debug: MethodCall node structure: {node}")
 
-            for arg in reversed(node["arguments"]):
-                self.evaluate_expression(arg, method_table)
-                self.instructions.append("    addi $sp, $sp, -4")
-                self.instructions.append("    sw $t0, 0($sp)")
+            # Handle method calls
+            target = node["target"]
+            method_name = node["method_name"]
 
-            self.instructions.append(f"    jal {node['method_name']}")
-            self.instructions.append(f"    addi $sp, $sp, {4 * len(node['arguments'])}")
-            self.instructions.append("    lw $t1, 0($sp)")
-            self.instructions.append("    lw $t0, 4($sp)")
-            self.instructions.append("    addi $sp, $sp, 8")
+            # Evaluate the target object (e.g., `new Fac()`)
+            self.evaluate_expression(target, method_table)
+            self.instructions.append("    move $t1, $t0  # Save target object reference")
+
+            # Push arguments onto the stack
+            arguments = node["arguments"]  # Assuming arguments is a list of expressions
+            if isinstance(arguments, list):
+                for arg in reversed(arguments):  # Reverse to maintain correct argument order
+                    self.evaluate_expression(arg, method_table)
+                    self.instructions.append("    addi $sp, $sp, -4")
+                    self.instructions.append("    sw $t0, 0($sp)")
+            else:
+                raise ValueError(f"Unexpected arguments format: {arguments}")
+
+
+            # Set 'this' for the method call (target object reference)
+            self.instructions.append("    move $a0, $t1  # Set 'this' for the method call")
+
+            # Generate the method label
+            class_name = target.get("class_name", self.current_class)  # Fallback to current class
+            qualified_method_name = f"{class_name}_{method_name}"
+            self.instructions.append(f"    jal {qualified_method_name}")
+
+            # Restore 'this' after the method call
+            self.instructions.append("    move $s0, $a0  # Restore 'this'")
+
+            # Clean up the stack after the call
+            self.instructions.append(f"    addi $sp, $sp, {4 * len(expressions)}  # Restore stack")
+
+            # Save the method's return value
             self.instructions.append("    move $t0, $v0")
+            
         else:
             raise ValueError(f"Unsupported command type: {node['type']}")
 
@@ -229,89 +270,115 @@ class MiniJavaCodeGenerator:
         if node["type"] == "Number":
             # Load an immediate value into $t0
             self.instructions.append(f"    li $t0, {node['value']}")
+
         elif node["type"] == "Identifier":
-            # Load a variable's value into $t0
-            reg_or_offset = method_table[node["name"]]
-            if isinstance(reg_or_offset, int):
-                self.instructions.append(f"    lw $t0, {reg_or_offset}($sp)")
-            elif isinstance(reg_or_offset, str):
-                self.instructions.append(f"    move $t0, {reg_or_offset}")
+            # Load a variable's value from the stack or register
+            if node["name"] in method_table:
+                offset = method_table[node["name"]]
+                self.instructions.append(f"    lw $t0, {offset}($sp)")
+            elif node["name"] in self.symbol_table[self.current_class]["fields"]:
+                # Access a field variable
+                field_offset = self.symbol_table[self.current_class]["fields"][node["name"]]
+                self.instructions.append(f"    lw $t0, {field_offset}($s0)")
             else:
-                raise ValueError(f"Unexpected type for variable '{node['name']}': {type(reg_or_offset)}")
+                raise ValueError(f"Variable '{node['name']}' not found in method or class scope.")
+
         elif node["type"] == "ArithmeticOp":
             # Evaluate arithmetic operations
-            self.evaluate_expression(node["left"], method_table)
-            self.instructions.append("    move $t1, $t0")  # Save left operand
-            self.evaluate_expression(node["right"], method_table)  # Evaluate right operand
-            if node["operator"] == "*":
-                self.instructions.append("    mul $t0, $t1, $t0")  # Multiply
-            elif node["operator"] == "+":
-                self.instructions.append("    add $t0, $t1, $t0")  # Add
+            left = node["left"]
+            right = node["right"]
+
+            # Evaluate left operand
+            self.evaluate_expression(left, method_table)
+            self.instructions.append("    move $t1, $t0")  # Save left operand in $t1
+
+            # Evaluate right operand
+            self.evaluate_expression(right, method_table)
+
+            # Perform the operation
+            if node["operator"] == "+":
+                self.instructions.append("    add $t0, $t1, $t0")
             elif node["operator"] == "-":
-                self.instructions.append("    sub $t0, $t1, $t0")  # Subtract
+                self.instructions.append("    sub $t0, $t1, $t0")
+            elif node["operator"] == "*":
+                self.instructions.append("    mul $t0, $t1, $t0")
             else:
                 raise ValueError(f"Unsupported operator: {node['operator']}")
-        elif node["type"] in ["RelationalOp", "ComparisonOp"]:
-            # Evaluate the left operand
-            self.evaluate_expression(node["left"], method_table)
-            self.instructions.append("    move $t1, $t0")  # Save the result of the left operand
 
-            # Evaluate the right operand
-            self.evaluate_expression(node["right"], method_table)
-
-            # Perform the relational operation
-            if node["operator"] == "<":
-                self.instructions.append("    slt $t0, $t1, $t0")  # Set $t0 if $t1 < $t0
-            elif node["operator"] == "<=":
-                self.instructions.append("    sle $t0, $t1, $t0")  # Set $t0 if $t1 <= $t0
-            elif node["operator"] == ">":
-                self.instructions.append("    sgt $t0, $t1, $t0")  # Set $t0 if $t1 > $t0
-            elif node["operator"] == ">=":
-                self.instructions.append("    sge $t0, $t1, $t0")  # Set $t0 if $t1 >= $t0
-            elif node["operator"] == "==":
-                self.instructions.append("    seq $t0, $t1, $t0")  # Set $t0 if $t1 == $t0
-            elif node["operator"] == "!=":
-                self.instructions.append("    sne $t0, $t1, $t0")  # Set $t0 if $t1 != $t0
-            else:
-                raise ValueError(f"Unsupported relational operator: {node['operator']}")
         elif node["type"] == "MethodCall":
-            # Extract arguments list from the node
-            arguments_node = node["arguments"]
-            if isinstance(arguments_node, dict) and "expressions" in arguments_node:
-                arguments = arguments_node["expressions"]
-            else:
-                raise ValueError(f"Unexpected structure for arguments in MethodCall: {arguments_node}")
+            # Debugging to inspect node structure
+            print(f"Debug: MethodCall node structure: {node}")
+            
+            # Handle method calls
+            target = node["target"]
+            method_name = node["method_name"]
 
-            # Handle the target of the method call
-            self.evaluate_expression(node["target"], method_table)
-            self.instructions.append("    move $t1, $t0  # Save target object")
+            # Evaluate the target object (e.g., `new Fac()`)
+            self.evaluate_expression(target, method_table)
+            self.instructions.append("    move $t1, $t0  # Save target object reference")
 
             # Push arguments onto the stack
-            for arg in reversed(arguments):
-                if not isinstance(arg, dict):
-                    raise ValueError(f"Expected an argument node of type dict, got: {type(arg)}")
+            for arg in reversed(node["arguments"]):
                 self.evaluate_expression(arg, method_table)
                 self.instructions.append("    addi $sp, $sp, -4")
                 self.instructions.append("    sw $t0, 0($sp)")
 
-            # Call the method
-            self.instructions.append(f"    jal {node['method_name']}")
+            # Set 'this' for the method call (target object reference)
+            self.instructions.append("    move $a0, $t1  # Set 'this' for the method call")
 
-            # Clean up the stack
-            self.instructions.append(f"    addi $sp, $sp, {4 * len(arguments)}")
+            # Generate the method label
+            class_name = target.get("class_name", self.current_class)  # Fallback to current class
+            qualified_method_name = f"{class_name}_{method_name}"
+            self.instructions.append(f"    jal {qualified_method_name}")
 
-            # Save the result of the method call
+            # Restore 'this' after the method call
+            self.instructions.append("    move $s0, $a0  # Restore 'this'")
+
+            # Clean up the stack after the call
+            self.instructions.append(f"    addi $sp, $sp, {4 * len(node['arguments'])}  # Restore stack")
+
+            # Save the method's return value
             self.instructions.append("    move $t0, $v0")
-        elif node["type"] == "This":
-            # Assuming $s0 holds the base address of the current object
-            self.instructions.append("    move $t0, $s0  # Load 'this' into $t0")
+
         elif node["type"] == "NewObject":
             # Handle object creation
             class_name = node["class_name"]
-            self.instructions.append(f"    # Create new object of class {class_name}")
-            self.instructions.append("    li $t0, 0  # Placeholder for object reference")
+            if class_name not in self.symbol_table:
+                raise ValueError(f"Class '{class_name}' not found in the symbol table during code generation.")
+
+            size = self.get_class_size(class_name)
+            self.instructions.append(f"    li $a0, {size}")  # Allocate space for object
+            self.instructions.append("    li $v0, 9")       # Syscall for memory allocation
+            self.instructions.append("    syscall")         # Perform allocation
+            self.instructions.append("    move $t0, $v0")   # Store allocated object address in $t0
+
+        elif node["type"] == "This":
+            # Load the current object reference into $t0
+            self.instructions.append("    move $t0, $s0")
+
         else:
             raise ValueError(f"Unsupported expression type: {node['type']}")
+
+    def analyze_expression(self, node):
+        if node["type"] == "ArithmeticOp":
+            left = self.analyze_expression(node["left"])
+            right = self.analyze_expression(node["right"])
+            if left["type"] == "Number" and right["type"] == "Number":
+                return {"type": "Number", "value": eval(f"{left['value']} {node['operator']} {right['value']}")}
+        return node
+    
+    def get_class_size(self, class_name):
+        if class_name not in self.symbol_table:
+            raise ValueError(f"Class '{class_name}' not found in the symbol table.")
+        
+        size = len(self.symbol_table[class_name]["fields"]) * 4
+        
+        parent_class = self.symbol_table[class_name].get("extends")
+        while parent_class:
+            size += len(self.symbol_table[parent_class]["fields"]) * 4
+            parent_class = self.symbol_table[parent_class].get("extends")
+        
+        return max(size, 4)
 
 
 # Example usage
@@ -347,10 +414,13 @@ if __name__ == "__main__":
     try:
         syntax_tree = analyzer.analyze()
         print("Semantic analysis completed successfully.")
+        
+        print("Symbol Table After Semantic Analysis:")
+        print(analyzer.symbol_table)
     except SemanticError as e:
         print(f"Semantic error: {e}")
 
-    generator = MiniJavaCodeGenerator(syntax_tree)
+    generator = MiniJavaCodeGenerator(syntax_tree, analyzer.symbol_table)
     mips_code = generator.generate()
     with open("output.asm", "w") as f:
         f.write(mips_code)
