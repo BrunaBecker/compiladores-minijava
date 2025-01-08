@@ -84,6 +84,7 @@ class MiniJavaCodeGenerator:
         self.instructions = []
         self.stack_offset = 0
         self.label_counter = 0
+        self.current_class = None
 
     def get_unique_label(self, base):
         label = f"{base}_{self.label_counter}"
@@ -116,6 +117,7 @@ class MiniJavaCodeGenerator:
 
     def generate_main_class(self, node):
         print(f"Generating MIPS for Main class '{node['class_name']}'...")
+        self.current_class = node['class_name']  
         self.instructions.append("main:")
         method_table = {}
         for command in node["commands"]:
@@ -141,7 +143,7 @@ class MiniJavaCodeGenerator:
         self.instructions.append(f"{qualified_name}:")
         
         # Prologue: Adjust stack pointer and save necessary registers
-        self.instructions.append(f"    addi $sp, $sp, {4 * len(node['arguments'])}  # Restore stack")
+        self.instructions.append(f"    addi $sp, $sp, {4 * len(node.get('parameters', []))}  # Restore stack")
         self.instructions.append("    sw $ra, 0($sp)      # Save return address")
         self.instructions.append("    sw $s0, 4($sp)      # Save current object reference")
         self.instructions.append("    sw $s1, 8($sp)      # Save caller's $s1")
@@ -178,6 +180,8 @@ class MiniJavaCodeGenerator:
 
 
     def generate_command(self, node, method_table):
+        print(f"Debug: Command Node: {node}")
+
         if node["type"] == "Assignment":
             self.evaluate_expression(node["value"], method_table)
             offset = method_table[node["target"]]
@@ -267,6 +271,15 @@ class MiniJavaCodeGenerator:
         self.instructions.append(f"{end_label}:")
 
     def evaluate_expression(self, node, method_table):
+        if not hasattr(self, 'current_class') or self.current_class is None:
+            raise ValueError("`current_class` is not set. Ensure it is initialized during code generation.")
+        if not isinstance(node, dict) or "type" not in node:
+            print(f"Warning: Patching malformed node: {node}")  # Debugging output
+            if isinstance(node, str):
+                node = {"type": node, "value": None}  # Convert to a default structure with a placeholder value
+            else:
+                raise ValueError(f"Unsupported node structure: {node}")
+
         if node["type"] == "Number":
             # Load an immediate value into $t0
             self.instructions.append(f"    li $t0, {node['value']}")
@@ -283,45 +296,25 @@ class MiniJavaCodeGenerator:
             else:
                 raise ValueError(f"Variable '{node['name']}' not found in method or class scope.")
 
-        elif node["type"] == "ArithmeticOp":
-            # Evaluate arithmetic operations
-            left = node["left"]
-            right = node["right"]
-
-            # Evaluate left operand
-            self.evaluate_expression(left, method_table)
-            self.instructions.append("    move $t1, $t0")  # Save left operand in $t1
-
-            # Evaluate right operand
-            self.evaluate_expression(right, method_table)
-
-            # Perform the operation
-            if node["operator"] == "+":
-                self.instructions.append("    add $t0, $t1, $t0")
-            elif node["operator"] == "-":
-                self.instructions.append("    sub $t0, $t1, $t0")
-            elif node["operator"] == "*":
-                self.instructions.append("    mul $t0, $t1, $t0")
-            else:
-                raise ValueError(f"Unsupported operator: {node['operator']}")
-
         elif node["type"] == "MethodCall":
-            # Debugging to inspect node structure
-            print(f"Debug: MethodCall node structure: {node}")
-            
             # Handle method calls
             target = node["target"]
             method_name = node["method_name"]
+            arguments = node["arguments"]
 
-            # Evaluate the target object (e.g., `new Fac()`)
-            self.evaluate_expression(target, method_table)
-            self.instructions.append("    move $t1, $t0  # Save target object reference")
+            # Normalize arguments if needed
+            if not isinstance(arguments, dict) or "type" not in arguments:
+                print(f"Warning: Patching malformed arguments: {arguments}")
+                arguments = {"type": "ExpressionList", "expressions": arguments if isinstance(arguments, list) else []}
 
-            # Push arguments onto the stack
-            for arg in reversed(node["arguments"]):
-                self.evaluate_expression(arg, method_table)
-                self.instructions.append("    addi $sp, $sp, -4")
-                self.instructions.append("    sw $t0, 0($sp)")
+            if arguments["type"] == "ExpressionList":
+                expressions = arguments["expressions"]
+                for arg in reversed(expressions):
+                    self.evaluate_expression(arg, method_table)
+                    self.instructions.append("    addi $sp, $sp, -4")
+                    self.instructions.append("    sw $t0, 0($sp)")
+            else:
+                raise ValueError(f"Unexpected arguments type: {arguments['type']}")
 
             # Set 'this' for the method call (target object reference)
             self.instructions.append("    move $a0, $t1  # Set 'this' for the method call")
@@ -333,9 +326,6 @@ class MiniJavaCodeGenerator:
 
             # Restore 'this' after the method call
             self.instructions.append("    move $s0, $a0  # Restore 'this'")
-
-            # Clean up the stack after the call
-            self.instructions.append(f"    addi $sp, $sp, {4 * len(node['arguments'])}  # Restore stack")
 
             # Save the method's return value
             self.instructions.append("    move $t0, $v0")
@@ -349,13 +339,51 @@ class MiniJavaCodeGenerator:
             size = self.get_class_size(class_name)
             self.instructions.append(f"    li $a0, {size}")  # Allocate space for object
             self.instructions.append("    li $v0, 9")       # Syscall for memory allocation
-            self.instructions.append("    syscall")         # Perform allocation
+            self.instructions.append("    syscall")
             self.instructions.append("    move $t0, $v0")   # Store allocated object address in $t0
 
         elif node["type"] == "This":
             # Load the current object reference into $t0
             self.instructions.append("    move $t0, $s0")
 
+        elif node["type"] == "RelationalOp":
+            self.evaluate_expression(node["left"], method_table)
+            self.instructions.append("    move $t1, $t0  # Save left operand in $t1")
+
+            # Evaluate right operand
+            self.evaluate_expression(node["right"], method_table)
+
+            # Perform relational operation
+            operator = node["operator"]
+            if operator == "<":
+                self.instructions.append("    slt $t0, $t1, $t0  # Set $t0 if $t1 < $t0")
+            elif operator == "==":
+                self.instructions.append("    seq $t0, $t1, $t0  # Set $t0 if $t1 == $t0")
+            elif operator == "!=":
+                self.instructions.append("    sne $t0, $t1, $t0  # Set $t0 if $t1 != $t0")
+            else:
+                raise ValueError(f"Unsupported relational operator: {operator}")
+
+        elif node["type"] == "ArithmeticOp":
+            # Evaluate left operand
+            self.evaluate_expression(node["left"], method_table)
+            self.instructions.append("    move $t1, $t0  # Save left operand in $t1")
+
+            # Evaluate right operand
+            self.evaluate_expression(node["right"], method_table)
+
+            # Perform the arithmetic operation
+            operator = node["operator"]
+            if operator == "+":
+                self.instructions.append("    add $t0, $t1, $t0  # Add $t1 and $t0")
+            elif operator == "-":
+                self.instructions.append("    sub $t0, $t1, $t0  # Subtract $t0 from $t1")
+            elif operator == "*":
+                self.instructions.append("    mul $t0, $t1, $t0  # Multiply $t1 and $t0")
+            elif operator == "/":
+                self.instructions.append("    div $t0, $t1, $t0  # Divide $t1 by $t0")
+            else:
+                raise ValueError(f"Unsupported arithmetic operator: {operator}")
         else:
             raise ValueError(f"Unsupported expression type: {node['type']}")
 
@@ -379,6 +407,12 @@ class MiniJavaCodeGenerator:
             parent_class = self.symbol_table[parent_class].get("extends")
         
         return max(size, 4)
+    
+    def get_enclosing_class_name(self, method_node):
+        if self.current_class is None:
+            raise ValueError("`current_class` is not set while trying to get the enclosing class name.")
+        return self.current_class
+
 
 
 # Example usage
